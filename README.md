@@ -20,6 +20,9 @@
 - [Step 9 — Configure Alertmanager Notifications](#step-9--configure-alertmanager-notifications)
 - [Step 10 — Import Grafana Dashboards](#step-10--import-grafana-dashboards)
 - [Step 11 — Expose via Ingress (HTTPS)](#step-11--expose-via-ingress-https)
+- [Step 11B — Expose via LoadBalancer (Simpler)](#step-11b--expose-via-loadbalancer-simpler)
+- [Step 11C — DNS & Node Exporter with Custom Domain](#step-11c--dns--node-exporter-with-custom-domain)
+- [Step 11D — Gmail SMTP for Alertmanager](#step-11d--gmail-smtp-for-alertmanager)
 - [Step 12 — Backup & Retention Policy](#step-12--backup--retention-policy)
 - [Verification & Testing](#verification--testing)
 - [Troubleshooting](#troubleshooting)
@@ -1173,6 +1176,286 @@ kubectl apply -f manifests/ingress.yaml
 # Get the ALB DNS name
 kubectl get ingress -n monitoring monitoring-ingress
 ```
+
+---
+
+## Step 11B — Expose via LoadBalancer (Simpler)
+
+> **When to use:** Skip the Ingress/ALB Controller complexity. Ideal when you just need public access quickly or for non-production use. Each service gets its own AWS Classic/NLB load balancer.
+
+### 11B.1 Change service types in Helm values
+
+In `values/kube-prometheus-stack-values.yaml`, update the service types:
+
+```yaml
+prometheus:
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"   # public
+      # service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"        # private (VPC only)
+
+grafana:
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+
+alertmanager:
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+```
+
+Apply the change:
+
+```bash
+helm upgrade kube-prometheus-stack \
+  prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --values values/kube-prometheus-stack-values.yaml \
+  --atomic --timeout 10m
+```
+
+### 11B.2 Get the LoadBalancer DNS names
+
+```bash
+# Wait ~60 seconds for AWS to provision the load balancers, then:
+kubectl get svc -n monitoring
+
+# You will see EXTERNAL-IP columns populated, e.g.:
+# monitoring-grafana            LoadBalancer   ...   a1b2c3d4.elb.amazonaws.com   80:31234/TCP
+# monitoring-prometheus         LoadBalancer   ...   e5f6g7h8.elb.amazonaws.com   9090:30001/TCP
+# monitoring-alertmanager       LoadBalancer   ...   i9j0k1l2.elb.amazonaws.com   9093:30002/TCP
+```
+
+Access directly using those DNS names:
+
+| Service | URL |
+|---------|-----|
+| Grafana | `http://<grafana-elb-dns>:80` |
+| Prometheus | `http://<prometheus-elb-dns>:9090` |
+| Alertmanager | `http://<alertmanager-elb-dns>:9093` |
+
+> **Security note:** LoadBalancer services expose ports publicly. Restrict access using security groups on the EKS nodes or add `service.beta.kubernetes.io/aws-load-balancer-source-ranges` annotation with your IP CIDR.
+
+---
+
+## Step 11C — DNS & Node Exporter with Custom Domain
+
+This section shows how to point your domain `theatique.online` to the LoadBalancer services and reference the domain in Prometheus/Grafana configuration.
+
+### 11C.1 Create DNS CNAME records
+
+In your DNS provider (Route 53, Cloudflare, etc.), add CNAME records pointing to the LoadBalancer DNS names you got in Step 11B:
+
+| Subdomain | Points to (CNAME) |
+|-----------|-------------------|
+| `grafana.theatique.online` | `<grafana-elb-dns>.elb.amazonaws.com` |
+| `prometheus.theatique.online` | `<prometheus-elb-dns>.elb.amazonaws.com` |
+| `alertmanager.theatique.online` | `<alertmanager-elb-dns>.elb.amazonaws.com` |
+
+**If using AWS Route 53:**
+
+```bash
+# Get your hosted zone ID
+aws route53 list-hosted-zones --query "HostedZones[?Name=='theatique.online.'].Id" --output text
+
+# Create a CNAME record (repeat for each subdomain)
+aws route53 change-resource-record-sets \
+  --hosted-zone-id <ZONE_ID> \
+  --change-batch '{
+    "Changes": [{
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "grafana.theatique.online",
+        "Type": "CNAME",
+        "TTL": 300,
+        "ResourceRecords": [{"Value": "<grafana-elb-dns>.elb.amazonaws.com"}]
+      }
+    }]
+  }'
+```
+
+### 11C.2 Update Grafana root URL with your domain
+
+In `values/kube-prometheus-stack-values.yaml`:
+
+```yaml
+grafana:
+  grafana.ini:
+    server:
+      root_url: "http://grafana.theatique.online"
+      domain: "grafana.theatique.online"
+```
+
+### 11C.3 Set Prometheus external URL (used in alert links)
+
+```yaml
+prometheus:
+  prometheusSpec:
+    externalUrl: "http://prometheus.theatique.online"
+```
+
+### 11C.4 Set Alertmanager external URL (used in notification links)
+
+```yaml
+alertmanager:
+  alertmanagerSpec:
+    externalUrl: "http://alertmanager.theatique.online"
+```
+
+### 11C.5 Node Exporter — reference domain in Prometheus scrape config
+
+Node Exporter runs as a DaemonSet and is scraped by Prometheus internally. To reference `theatique.online` in scrape labels or alert annotations, update your `PrometheusRule` or `AlertmanagerConfig` external URL references:
+
+In `manifests/prometheus-rules.yaml`, update runbook URLs to use your domain:
+
+```yaml
+annotations:
+  runbook_url: "http://grafana.theatique.online/d/node-exporter/node-exporter-full"
+```
+
+If you are running node exporter **outside** of Kubernetes (on bare-metal or EC2 directly), add a static scrape target in the Helm values:
+
+```yaml
+prometheus:
+  prometheusSpec:
+    additionalScrapeConfigs:
+      - job_name: "node-exporter-external"
+        static_configs:
+          - targets:
+              - "theatique.online:9100"   # Node Exporter default port
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: instance
+            replacement: "theatique.online"
+```
+
+Apply all changes:
+
+```bash
+helm upgrade kube-prometheus-stack \
+  prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --values values/kube-prometheus-stack-values.yaml \
+  --atomic --timeout 10m
+```
+
+---
+
+## Step 11D — Gmail SMTP for Alertmanager
+
+Send alert email notifications using your own Gmail account.
+
+### Prerequisites
+
+- A Gmail account (e.g. `yourname@gmail.com`)
+- **2-Step Verification must be enabled** on the account (required for App Passwords)
+
+### 11D.1 Generate a Gmail App Password
+
+1. Go to your Google Account: https://myaccount.google.com
+2. Navigate to **Security** → **2-Step Verification** (enable it if not already)
+3. Go to **Security** → **App passwords** (https://myaccount.google.com/apppasswords)
+4. Click **Select app** → choose **Mail**
+5. Click **Select device** → choose **Other (custom name)** → type `Alertmanager`
+6. Click **Generate**
+7. **Copy the 16-character password** shown (e.g. `abcd efgh ijkl mnop`) — you will only see it once
+
+> **Important:** Use the App Password, NOT your normal Gmail password. Remove spaces from the 16-character password before using it.
+
+### 11D.2 Store the App Password as a Kubernetes secret
+
+```bash
+kubectl create secret generic alertmanager-notifications \
+  --namespace monitoring \
+  --from-literal=slack-webhook-url='https://hooks.slack.com/services/XXX/YYY/ZZZ' \
+  --from-literal=smtp-password='abcdefghijklmnop'    # 16-char app password, no spaces
+```
+
+If the secret already exists, patch it:
+
+```bash
+kubectl patch secret alertmanager-notifications \
+  --namespace monitoring \
+  --type merge \
+  --patch '{"stringData":{"smtp-password":"abcdefghijklmnop"}}'
+```
+
+### 11D.3 Configure Alertmanager email receiver
+
+Update `manifests/alertmanager-config.yaml` — replace the `email-alerts` receiver with:
+
+```yaml
+receivers:
+  - name: email-alerts
+    emailConfigs:
+      - to: 'recipient@example.com'            # Who receives the alert
+        from: 'yourname@gmail.com'             # Your Gmail address
+        smarthost: 'smtp.gmail.com:587'        # Gmail SMTP server
+        authUsername: 'yourname@gmail.com'     # Your Gmail address
+        authPassword:
+          name: alertmanager-notifications     # Kubernetes secret name
+          key: smtp-password                   # Secret key
+        requireTLS: true                       # Always true for Gmail
+        sendResolved: true
+        headers:
+          subject: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }} — theatique.online'
+        html: |-
+          <h2>{{ .CommonAnnotations.summary }}</h2>
+          <p><strong>Status:</strong> {{ .Status | toUpper }}</p>
+          <p><strong>Severity:</strong> {{ .CommonLabels.severity }}</p>
+          <p><strong>Description:</strong> {{ .CommonAnnotations.description }}</p>
+          <p><a href="http://grafana.theatique.online">Open Grafana Dashboard</a></p>
+          <p><a href="http://alertmanager.theatique.online">Open Alertmanager</a></p>
+```
+
+### 11D.4 Wire email-alerts into the routing tree
+
+In the same `alertmanager-config.yaml`, add `email-alerts` to the route:
+
+```yaml
+route:
+  receiver: slack-warnings     # default
+  routes:
+    - matchers:
+        - name: severity
+          value: critical
+      receiver: email-alerts   # send critical alerts by email
+      continue: true           # also send to other receivers
+    - matchers:
+        - name: severity
+          value: critical
+      receiver: pagerduty-critical
+```
+
+Apply and verify:
+
+```bash
+kubectl apply -f manifests/alertmanager-config.yaml
+
+# Check Alertmanager accepted the config (no errors)
+kubectl logs -n monitoring alertmanager-monitoring-alertmanager-0 -c alertmanager | tail -20
+
+# Test: port-forward and use the UI to send a test alert
+kubectl port-forward -n monitoring svc/monitoring-alertmanager 9093:9093
+# Open http://localhost:9093 → Status → Config — confirm email receiver is present
+```
+
+### Gmail SMTP Quick Reference
+
+| Setting | Value |
+|---------|-------|
+| SMTP Host | `smtp.gmail.com` |
+| Port | `587` (STARTTLS) |
+| Auth Username | your full Gmail address |
+| Auth Password | 16-character App Password (no spaces) |
+| TLS | Required (`requireTLS: true`) |
+| From address | your full Gmail address |
+
+> **Tip:** Gmail allows up to 500 emails/day on free accounts. For high-volume alerting, consider a transactional email service (SendGrid, AWS SES).
 
 ---
 
