@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Probe CRD — tells Prometheus to use Blackbox Exporter to probe your app's
+# LoadBalancer URL.
+#
+# HOW TO USE:
+#   1. Deploy your app with a LoadBalancer service, then get the URL:
+#        kubectl get svc <your-app-service> -n <app-namespace> \
+#          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+#
+#   2. Replace the placeholder URL below with your actual LoadBalancer hostname.
+#      For AWS ELB it looks like:
+#        http://abc123.us-east-1.elb.amazonaws.com
+#      For HTTPS:
+#        https://abc123.us-east-1.elb.amazonaws.com
+#
+#   3. Apply:  kubectl apply -f manifests/blackbox/probe.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: app-loadbalancer-probe
+  namespace: monitoring
+  labels:
+    # This label must match the Prometheus Operator probe selector.
+    # kube-prometheus-stack default selector is: release=<helm-release-name>
+    release: kube-prometheus-stack
+spec:
+  # Which Blackbox Exporter module to use (defined in the ConfigMap)
+  # Use 'http_2xx' for HTTP, 'http_2xx_tls' for HTTPS
+  module: http_2xx
+
+  # Reference to the Blackbox Exporter service
+  prober:
+    url: blackbox-exporter.monitoring.svc.cluster.local:9115
+    scheme: http
+    path: /probe
+
+  # How often to probe
+  interval: 30s
+  scrapeTimeout: 10s
+
+  # The targets to probe — set your LoadBalancer URL here
+  targets:
+    staticConfig:
+      static:
+        - http://<YOUR-LOADBALANCER-HOSTNAME>        # ← replace this
+        # Add more URLs if needed:
+        # - http://<ANOTHER-LOADBALANCER-HOSTNAME>/healthz
+
+      # Labels added to every metric scraped from these targets
+      labels:
+        app: my-application          # ← change to your app name
+        env: production

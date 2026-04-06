@@ -24,6 +24,7 @@
 - [Step 11C — DNS & Node Exporter with Custom Domain](#step-11c--dns--node-exporter-with-custom-domain)
 - [Step 11D — Gmail SMTP for Alertmanager](#step-11d--gmail-smtp-for-alertmanager)
 - [Step 12 — Backup & Retention Policy](#step-12--backup--retention-policy)
+- [Step 13 — Blackbox Exporter — Monitor LoadBalancer Endpoint](#step-13--blackbox-exporter--monitor-loadbalancer-endpoint)
 - [Verification & Testing](#verification--testing)
 - [Troubleshooting](#troubleshooting)
 - [Security Hardening](#security-hardening)
@@ -1749,6 +1750,150 @@ kubectl get all -n monitoring
 
 # View firing alerts
 kubectl get prometheusrule -n monitoring
+```
+
+---
+
+---
+
+## Step 13 — Blackbox Exporter — Monitor LoadBalancer Endpoint
+
+Use Blackbox Exporter to probe your app's AWS LoadBalancer URL from inside the cluster and visualise uptime, response time, SSL expiry, and HTTP status in Grafana.
+
+### Architecture
+
+```
+ Your App (LoadBalancer)
+   ↓  ELB URL
+ Blackbox Exporter  ←── Prometheus (Probe CRD) ──→ Grafana Dashboard
+```
+
+### 13.1 Deploy Blackbox Exporter
+
+```bash
+kubectl apply -f manifests/blackbox/configmap.yaml
+kubectl apply -f manifests/blackbox/deployment.yaml
+kubectl apply -f manifests/blackbox/service.yaml
+
+# Verify it is running
+kubectl get pods -n monitoring -l app=blackbox-exporter
+```
+
+### 13.2 Get your app's LoadBalancer URL
+
+```bash
+# Replace <YOUR-APP-SERVICE> and <YOUR-APP-NAMESPACE> with your values
+LB_URL=$(kubectl get svc <YOUR-APP-SERVICE> \
+  -n <YOUR-APP-NAMESPACE> \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+echo "LoadBalancer URL: $LB_URL"
+# e.g. abc123def456.us-east-1.elb.amazonaws.com
+```
+
+> **Note:** On AWS the ingress field is `hostname`. On other clouds it may be `ip`.
+> For HTTPS targets change the scheme to `https://` and set `module: http_2xx_tls` in the Probe.
+
+### 13.3 Configure the Probe
+
+Edit `manifests/blackbox/probe.yaml` and replace the placeholder with the URL from the previous step:
+
+```yaml
+targets:
+  staticConfig:
+    static:
+      - http://<YOUR-LOADBALANCER-HOSTNAME>   # ← paste the ELB hostname here
+    labels:
+      app: my-application   # ← set to your app name
+```
+
+Apply the Probe:
+
+```bash
+kubectl apply -f manifests/blackbox/probe.yaml
+
+# Verify Prometheus picked it up
+kubectl get probe -n monitoring
+```
+
+### 13.4 Verify probing works
+
+```bash
+# Port-forward Blackbox Exporter locally
+kubectl port-forward svc/blackbox-exporter 9115:9115 -n monitoring &
+
+# Test a manual probe (replace the URL)
+curl "http://localhost:9115/probe?target=http://<YOUR-LB-HOSTNAME>&module=http_2xx"
+
+# Look for: probe_success 1  (means UP)
+```
+
+You can also open `http://localhost:9115` in a browser to see the Blackbox Exporter web UI.
+
+### 13.5 Import Grafana Dashboard
+
+1. Open Grafana → **Dashboards → Import**
+2. Upload `values/grafana-dashboards/blackbox-dashboard.json`
+3. Select your Prometheus datasource
+4. Click **Import**
+
+The dashboard shows:
+
+| Panel | Description |
+|-------|-------------|
+| 🟢 **Endpoint Up/Down** | `probe_success` — 1=UP, 0=DOWN |
+| ⏱ **Probe Duration** | Total HTTP round-trip time |
+| 🔢 **HTTP Status Code** | Live HTTP response code |
+| 🔒 **SSL Expiry (days)** | Days until certificate expires |
+| **Duration Over Time** | Historical response time graph |
+| **Availability Timeline** | Up/down history |
+| **DNS Lookup Time** | DNS resolution latency |
+| **TCP Connect / TLS Time** | Network breakdown |
+
+### 13.6 Add Alerting Rule (optional)
+
+Add to `manifests/prometheus-rules.yaml`:
+
+```yaml
+- alert: EndpointDown
+  expr: probe_success{job=~"probe/monitoring/.*"} == 0
+  for: 1m
+  labels:
+    severity: critical
+  annotations:
+    summary: "LoadBalancer endpoint is DOWN"
+    description: "{{ $labels.instance }} has been unreachable for more than 1 minute."
+
+- alert: SlowResponseTime
+  expr: probe_duration_seconds{job=~"probe/monitoring/.*"} > 2
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Slow response time detected"
+    description: "{{ $labels.instance }} is responding in {{ $value | humanizeDuration }}."
+
+- alert: SSLCertExpiringSoon
+  expr: (probe_ssl_earliest_cert_expiry{job=~"probe/monitoring/.*"} - time()) / 86400 < 14
+  for: 1h
+  labels:
+    severity: warning
+  annotations:
+    summary: "SSL certificate expiring soon"
+    description: "{{ $labels.instance }} cert expires in {{ $value | humanize }} days."
+```
+
+### 13.7 Files reference
+
+```
+manifests/blackbox/
+├── configmap.yaml   # Blackbox Exporter probe modules (HTTP, HTTPS, TCP, ICMP)
+├── deployment.yaml  # Blackbox Exporter pod
+├── service.yaml     # ClusterIP service (port 9115)
+└── probe.yaml       # Prometheus Probe CRD — points at your LB URL
+
+values/grafana-dashboards/
+└── blackbox-dashboard.json   # Pre-built Grafana dashboard
 ```
 
 ---
